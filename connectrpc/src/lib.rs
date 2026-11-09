@@ -242,6 +242,11 @@ pub mod server;
 #[cfg_attr(docsrs, doc(cfg(all(feature = "axum", feature = "server"))))]
 pub mod axum;
 
+// Optional: Connect over WebSocket
+#[cfg(feature = "websocket")]
+#[cfg_attr(docsrs, doc(cfg(feature = "websocket")))]
+pub mod websocket;
+
 // ============================================================================
 // Primary exports - Tower-first API
 // ============================================================================
