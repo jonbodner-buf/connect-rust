@@ -717,6 +717,27 @@ impl EndStreamResponse {
     }
 }
 
+/// The JSON `EndStreamResponse` that ends a stream with `err`, the same
+/// payload a Connect streaming response carries in its END_STREAM envelope.
+#[cfg(feature = "websocket")]
+pub(crate) fn end_stream_error_json(err: &ConnectError) -> Bytes {
+    EndStreamResponse::error(err, err.trailers()).to_json()
+}
+
+/// Whether a request was synthesized by a WebSocket session, whose unary
+/// methods use streaming framing.
+#[cfg(feature = "websocket")]
+fn is_websocket_dispatch(extensions: &http::Extensions) -> bool {
+    extensions
+        .get::<crate::websocket::server::WebSocketDispatch>()
+        .is_some()
+}
+
+#[cfg(not(feature = "websocket"))]
+fn is_websocket_dispatch(_: &http::Extensions) -> bool {
+    false
+}
+
 /// Response headers that may never be carried from a propagated error
 /// onto this response. Three classes, none of which describe the response
 /// being built.
@@ -1360,6 +1381,8 @@ pub struct ConnectRpcService<D = Router> {
     /// Interceptor chain, outermost first. One pointer to clone per
     /// request regardless of chain length.
     interceptors: InterceptorChain,
+    #[cfg(feature = "websocket")]
+    websocket: Option<Arc<crate::websocket::WebSocketConfig>>,
 }
 
 // Manual Clone impl because `#[derive(Clone)]` would add a `D: Clone` bound,
@@ -1373,6 +1396,8 @@ impl<D> Clone for ConnectRpcService<D> {
             compression_policy: self.compression_policy,
             deadline_policy: self.deadline_policy.clone(),
             interceptors: self.interceptors.clone(),
+            #[cfg(feature = "websocket")]
+            websocket: self.websocket.clone(),
         }
     }
 }
@@ -1397,6 +1422,8 @@ impl<D: Dispatcher> ConnectRpcService<D> {
             compression_policy: CompressionPolicy::default(),
             deadline_policy: DeadlinePolicy::new(),
             interceptors: InterceptorChain::default(),
+            #[cfg(feature = "websocket")]
+            websocket: None,
         }
     }
 
@@ -1495,6 +1522,26 @@ impl<D: Dispatcher> ConnectRpcService<D> {
     pub fn with_interceptor_arc(mut self, interceptor: Arc<dyn Interceptor>) -> Self {
         self.interceptors.push(interceptor);
         self
+    }
+
+    /// Accept Connect over WebSocket on every registered procedure, in
+    /// addition to Connect, gRPC and gRPC-Web over HTTP.
+    ///
+    /// A request carrying `Connection: Upgrade` and `Upgrade: websocket` is
+    /// a WebSocket handshake; anything else is served as before. See the
+    /// [`websocket`](crate::websocket) module for the protocol, the
+    /// server requirements, and where authentication belongs.
+    #[cfg(feature = "websocket")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "websocket")))]
+    #[must_use]
+    pub fn with_websocket(mut self, config: crate::websocket::WebSocketConfig) -> Self {
+        self.websocket = Some(Arc::new(config));
+        self
+    }
+
+    #[cfg(all(feature = "websocket", feature = "server"))]
+    pub(crate) fn websocket_config(&self) -> Option<&crate::websocket::WebSocketConfig> {
+        self.websocket.as_deref()
     }
 
     /// Get the current limits configuration.
@@ -1604,6 +1651,29 @@ where
     }
 
     fn call(&mut self, req: Request<B>) -> Self::Future {
+        #[cfg(feature = "websocket")]
+        if let Some(config) = &self.websocket
+            && !is_websocket_dispatch(req.extensions())
+        {
+            use crate::websocket::server::{Route, accept, route};
+            let response = match route(config, &req) {
+                Route::Http => None,
+                Route::Respond(response) => Some(*response),
+                Route::Upgrade(procedure) => {
+                    let config = Arc::clone(config);
+                    return Box::pin(std::future::ready(Ok(accept(
+                        self.clone(),
+                        config,
+                        req,
+                        procedure,
+                    ))));
+                }
+            };
+            if let Some(response) = response {
+                return Box::pin(std::future::ready(Ok(response)));
+            }
+        }
+
         let dispatcher = Arc::clone(&self.dispatcher);
         let limits = self.limits;
         let compression = Arc::clone(&self.compression);
@@ -2494,6 +2564,7 @@ where
     // from there into the handler context), the body is read or streamed below.
     let (parts, body) = req.into_parts();
     let extensions = parts.extensions;
+    let via_websocket = is_websocket_dispatch(&extensions);
     let mut metadata = RequestMetadata::from_headers(parts.headers, protocol);
     metadata.timeout = deadline_policy.moderate(metadata.timeout, path);
 
@@ -2587,6 +2658,8 @@ where
         Some(MethodKind::Unary) => match protocol {
             // gRPC sends unary RPCs with streaming framing, so fall through.
             Protocol::Grpc | Protocol::GrpcWeb => StreamingDispatchKind::Unary,
+            // So does Connect over WebSocket, which has no unary framing.
+            Protocol::Connect if via_websocket => StreamingDispatchKind::Unary,
             Protocol::Connect => {
                 let err =
                     ConnectError::invalid_argument("streaming content type used for unary method");
