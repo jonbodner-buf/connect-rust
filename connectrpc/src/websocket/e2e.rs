@@ -1,5 +1,6 @@
 //! End-to-end tests: the built-in server with WebSocket enabled, driven by a
-//! raw tungstenite client for the wire-level rules.
+//! raw tungstenite client for the wire-level rules. The client transport's
+//! tests are in `transport`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -18,6 +19,9 @@ use crate::handler::{
     bidi_streaming_handler_fn, client_streaming_handler_fn, handler_fn, streaming_handler_fn,
 };
 use crate::{ConnectError, ConnectRpcService, RequestContext, Response, Router};
+
+#[cfg(feature = "client")]
+mod transport;
 
 const SVC: &str = "test.v1.EchoService";
 

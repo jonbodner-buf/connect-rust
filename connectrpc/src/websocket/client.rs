@@ -1,0 +1,1070 @@
+//! The client half of Connect over WebSocket: a [`ClientTransport`] that
+//! carries each Connect request over its own WebSocket connection.
+//!
+//! The call path builds an ordinary Connect request (unary or streaming);
+//! this transport translates it into the WebSocket messages and translates
+//! what comes back into the Connect response the call path expects, so
+//! generated clients need no changes.
+
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
+
+use bytes::{Bytes, BytesMut};
+use futures::StreamExt;
+use futures::stream::{SplitSink, SplitStream};
+use http::header::{self, HeaderName, HeaderValue};
+use http::{HeaderMap, Request, Response, StatusCode, Uri};
+use http_body::{Body, Frame};
+use http_body_util::BodyExt;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{mpsc, oneshot};
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::error::ProtocolError;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig as FrameConfig;
+use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+
+use super::wire::{
+    self, DEFAULT_INFRASTRUCTURE_HEADERS, Fault, Marker, Outbound, Side, WireError, close_code,
+    decode_metadata, encode_metadata, is_protocol_header, is_reserved_request_key,
+};
+use crate::client::{BoxFuture, ClientBody, ClientTransport};
+use crate::codec::CodecFormat;
+use crate::compression::CompressionRegistry;
+use crate::envelope::{EnvelopeAssembler, flags};
+use crate::error::{ConnectError, ErrorCode};
+use crate::protocol::Protocol;
+use crate::service::DEFAULT_MAX_MESSAGE_SIZE;
+
+/// The default for [`WebSocketTransport::with_handshake_timeout`]: ten
+/// seconds for DNS, TCP, TLS and the upgrade together.
+pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many response messages may wait for the caller before the transport
+/// stops reading the connection.
+const RESPONSE_QUEUE: usize = 2;
+
+/// The close code a client sends when the server negotiated an extension
+/// this binding forbids (§10).
+const BAD_COMPRESSION: u16 = 3110;
+
+/// A [`ClientTransport`] that carries Connect RPCs over WebSocket, one
+/// connection per RPC.
+///
+/// Use it with a generated client and a [`ClientConfig`] whose protocol is
+/// Connect (the default) and whose base URI is the server's `http://` or
+/// `https://` address; the transport switches the scheme to `ws://` or
+/// `wss://`:
+///
+/// ```rust,ignore
+/// use connectrpc::client::ClientConfig;
+/// use connectrpc::websocket::WebSocketTransport;
+///
+/// let transport = WebSocketTransport::plaintext();
+/// let config = ClientConfig::new("http://localhost:8080".parse()?);
+/// let client = ChatServiceClient::new(transport, config);
+/// let mut stream = client.chat().await?; // full-duplex bidi
+/// ```
+///
+/// Every RPC kind is supported, unary included, and a bidi stream is full
+/// duplex. Messages are always sent uncompressed, since this binding has no
+/// message compression: a request compression set on the [`ClientConfig`] is
+/// undone, and its encoding headers are not sent. Connect GET and the gRPC
+/// protocols are not supported.
+///
+/// Request headers go to the server in the opening metadata message. Names a
+/// server rejects there by default (`Cookie`, `Host`, `Sec-*`, `Forwarded`,
+/// `X-Forwarded-*`, ...) fail the call with `invalid_argument` before
+/// dialing.
+///
+/// Native targets only; in a browser, use the browser's `WebSocket` through
+/// a JavaScript Connect client.
+///
+/// [`ClientConfig`]: crate::client::ClientConfig
+#[derive(Clone)]
+pub struct WebSocketTransport {
+    options: Arc<Options>,
+}
+
+#[derive(Clone)]
+struct Options {
+    path_prefix: Option<String>,
+    max_message_size: usize,
+    handshake_timeout: Option<Duration>,
+    #[cfg(feature = "client-tls")]
+    tls: Option<Arc<rustls::ClientConfig>>,
+}
+
+impl std::fmt::Debug for WebSocketTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("WebSocketTransport");
+        debug
+            .field("path_prefix", &self.options.path_prefix)
+            .field("max_message_size", &self.options.max_message_size)
+            .field("handshake_timeout", &self.options.handshake_timeout);
+        #[cfg(feature = "client-tls")]
+        debug.field("tls", &self.options.tls.is_some());
+        debug.finish()
+    }
+}
+
+impl WebSocketTransport {
+    /// A transport for cleartext `ws://` connections only.
+    #[must_use]
+    pub fn plaintext() -> Self {
+        Self {
+            options: Arc::new(Options {
+                path_prefix: None,
+                max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+                handshake_timeout: Some(DEFAULT_HANDSHAKE_TIMEOUT),
+                #[cfg(feature = "client-tls")]
+                tls: None,
+            }),
+        }
+    }
+
+    /// A transport for `wss://` (and cleartext `ws://`) connections, with
+    /// `tls_config` for TLS. ALPN is set to `http/1.1`, since the WebSocket
+    /// handshake requires HTTP/1.1.
+    #[cfg(feature = "client-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "client-tls")))]
+    #[must_use]
+    pub fn with_tls(tls_config: Arc<rustls::ClientConfig>) -> Self {
+        let mut config = (*tls_config).clone();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let mut transport = Self::plaintext();
+        transport.options_mut().tls = Some(Arc::new(config));
+        transport
+    }
+
+    /// Put `prefix` between the base URI's path and the procedure, to match
+    /// a server configured with
+    /// [`WebSocketConfig::with_path_prefix`](super::WebSocketConfig::with_path_prefix).
+    /// Leading and trailing `/` are ignored.
+    #[must_use]
+    pub fn with_path_prefix(mut self, prefix: impl AsRef<str>) -> Self {
+        let trimmed = prefix.as_ref().trim_matches('/');
+        self.options_mut().path_prefix = (!trimmed.is_empty()).then(|| format!("/{trimmed}"));
+        self
+    }
+
+    /// The largest message the server may send, in bytes. A larger one
+    /// fails the RPC with `resource_exhausted`. Defaults to 4 MiB.
+    #[must_use]
+    pub fn with_max_message_size(mut self, size: usize) -> Self {
+        self.options_mut().max_message_size = size;
+        self
+    }
+
+    /// Bound connection setup: DNS, TCP, TLS and the upgrade. Defaults to
+    /// [`DEFAULT_HANDSHAKE_TIMEOUT`]; `None` or zero removes the bound. The
+    /// RPC itself is bounded by its own deadline, not this.
+    #[must_use]
+    pub fn with_handshake_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.options_mut().handshake_timeout = timeout.into().filter(|t| !t.is_zero());
+        self
+    }
+
+    fn options_mut(&mut self) -> &mut Options {
+        Arc::make_mut(&mut self.options)
+    }
+}
+
+impl ClientTransport for WebSocketTransport {
+    type ResponseBody = WebSocketBody;
+    type Error = ConnectError;
+
+    fn send(
+        &self,
+        request: Request<ClientBody>,
+    ) -> BoxFuture<'static, Result<Response<WebSocketBody>, ConnectError>> {
+        let options = Arc::clone(&self.options);
+        Box::pin(async move { start(options, request).await })
+    }
+}
+
+/// The response body [`WebSocketTransport`] returns.
+///
+/// For a streaming RPC it yields the server's messages as Connect envelopes,
+/// ending with the end-of-stream envelope; for a unary RPC it is the single
+/// response message. A failure on the connection is its error.
+pub struct WebSocketBody {
+    inner: BodyInner,
+}
+
+enum BodyInner {
+    Full(Option<Bytes>),
+    Stream(mpsc::Receiver<Result<Bytes, ConnectError>>),
+}
+
+impl std::fmt::Debug for WebSocketBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebSocketBody").finish_non_exhaustive()
+    }
+}
+
+impl Body for WebSocketBody {
+    type Data = Bytes;
+    type Error = ConnectError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, ConnectError>>> {
+        match &mut self.inner {
+            BodyInner::Full(data) => Poll::Ready(data.take().map(|data| Ok(Frame::data(data)))),
+            BodyInner::Stream(rx) => rx
+                .poll_recv(cx)
+                .map(|item| item.map(|item| item.map(Frame::data))),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        matches!(&self.inner, BodyInner::Full(None))
+    }
+}
+
+/// What the call path asked for, read from its request.
+struct Call {
+    codec: CodecFormat,
+    unary: bool,
+    /// Request compression to undo: `content-encoding` for unary, the
+    /// `connect-content-encoding` of compressed envelopes for streaming.
+    encoding: Option<String>,
+}
+
+async fn start(
+    options: Arc<Options>,
+    request: Request<ClientBody>,
+) -> Result<Response<WebSocketBody>, ConnectError> {
+    let (parts, body) = request.into_parts();
+    if parts.method == http::Method::GET {
+        return Err(ConnectError::unimplemented(
+            "Connect GET requests cannot be sent over WebSocket",
+        ));
+    }
+    let detected = Protocol::detect(&parts.headers)
+        .filter(|detected| detected.protocol == Protocol::Connect)
+        .ok_or_else(|| {
+            ConnectError::unimplemented("WebSocketTransport carries only the Connect protocol")
+        })?;
+    let encoding_header = if detected.is_streaming {
+        "connect-content-encoding"
+    } else {
+        "content-encoding"
+    };
+    let call = Call {
+        codec: detected.codec_format,
+        unary: !detected.is_streaming,
+        encoding: parts
+            .headers
+            .get(encoding_header)
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| *v != "identity")
+            .map(str::to_owned),
+    };
+    let timeout = parts
+        .headers
+        .get("connect-timeout-ms")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let uri = websocket_uri(
+        &parts.uri,
+        options.path_prefix.as_deref(),
+        timeout.as_deref(),
+    )?;
+    if let Some(name) = parts.headers.keys().find(|name| {
+        !skip_request_header(name)
+            && is_reserved_request_key(name.as_str(), DEFAULT_INFRASTRUCTURE_HEADERS)
+    }) {
+        return Err(ConnectError::invalid_argument(format!(
+            "header {:?} cannot be sent over WebSocket; servers reject it in request metadata by default",
+            name.as_str()
+        )));
+    }
+    let metadata = encode_metadata(&parts.headers, skip_request_header);
+
+    let connecting = connect(&options, uri, call.codec);
+    let ws = match options.handshake_timeout {
+        Some(timeout) => tokio::time::timeout(timeout, connecting)
+            .await
+            .map_err(|_| ConnectError::unavailable("WebSocket handshake timed out"))??,
+        None => connecting.await?,
+    };
+
+    let (head_tx, head_rx) = oneshot::channel();
+    let (sink, stream) = ws.split();
+    let session = Session {
+        sink,
+        stream,
+        outbound: Outbound::default(),
+        codec: call.codec,
+        max_message_size: options.max_message_size,
+    };
+    crate::spawn_detached(session.run(call, metadata, body, head_tx));
+    head_rx.await.unwrap_or_else(|_| {
+        Err(ConnectError::internal(
+            "WebSocket session ended unexpectedly",
+        ))
+    })
+}
+
+/// The handshake URI (§4.2): `ws`/`wss` for `http`/`https`, the prefix
+/// between the base path and the procedure, and the deadline as a query
+/// parameter.
+fn websocket_uri(
+    uri: &Uri,
+    prefix: Option<&str>,
+    timeout: Option<&str>,
+) -> Result<Uri, ConnectError> {
+    let scheme = match uri.scheme_str() {
+        Some("http" | "ws") => "ws",
+        Some("https" | "wss") => "wss",
+        other => {
+            return Err(ConnectError::invalid_argument(format!(
+                "unsupported URI scheme {other:?} for WebSocket"
+            )));
+        }
+    };
+    let authority = uri
+        .authority()
+        .ok_or_else(|| ConnectError::invalid_argument("request URI has no authority"))?;
+    let path = uri.path();
+    let path = match prefix {
+        Some(prefix) => {
+            // The procedure is always the last two segments.
+            let mut segments = path.rsplitn(3, '/');
+            let method = segments.next().unwrap_or_default();
+            let service = segments.next().unwrap_or_default();
+            let base = segments.next().unwrap_or_default();
+            format!("{base}{prefix}/{service}/{method}")
+        }
+        None => path.to_owned(),
+    };
+    let mut target = format!("{scheme}://{authority}{path}");
+    if let Some(timeout) = timeout {
+        target.push('?');
+        target.push_str(wire::TIMEOUT_PARAM);
+        target.push('=');
+        target.push_str(timeout);
+    }
+    target
+        .parse()
+        .map_err(|e| ConnectError::internal(format!("invalid WebSocket URI {target:?}: {e}")))
+}
+
+/// Request headers the protocol carries some other way, or that describe
+/// the HTTP request rather than the RPC.
+fn skip_request_header(name: &HeaderName) -> bool {
+    is_protocol_header(name.as_str())
+        || matches!(
+            name.as_str(),
+            "content-length" | "transfer-encoding" | "connection" | "te" | "host" | "upgrade"
+        )
+}
+
+trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
+
+type Socket = WebSocketStream<Box<dyn Io>>;
+
+/// Dial, optionally wrap in TLS, and perform the WebSocket handshake.
+async fn connect(options: &Options, uri: Uri, codec: CodecFormat) -> Result<Socket, ConnectError> {
+    let host = uri
+        .host()
+        .ok_or_else(|| ConnectError::internal("WebSocket URI has no host"))?;
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_owned();
+    let secure = uri.scheme_str() == Some("wss");
+    let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
+    let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
+        .await
+        .map_err(|e| ConnectError::unavailable_from_transport(e, "WebSocket connect failed"))?;
+    let _ = tcp.set_nodelay(true);
+    let io: Box<dyn Io> = if secure {
+        tls_wrap(options, &host, tcp).await?
+    } else {
+        Box::new(tcp)
+    };
+
+    let mut request = uri
+        .into_client_request()
+        .map_err(|e| ConnectError::internal(format!("invalid WebSocket request: {e}")))?;
+    request.headers_mut().insert(
+        header::SEC_WEBSOCKET_PROTOCOL,
+        HeaderValue::from_static(wire::subprotocol_token(codec)),
+    );
+    let max = options.max_message_size.saturating_add(1);
+    let config = FrameConfig::default()
+        .max_message_size(Some(max))
+        .max_frame_size(Some(max));
+    let (mut ws, response) = tokio_tungstenite::client_async_with_config(request, io, Some(config))
+        .await
+        .map_err(handshake_error)?;
+    // Compression is never offered, so any negotiated extension is the
+    // server imposing one, which this binding forbids without
+    // no_context_takeover in both directions (§10).
+    if response
+        .headers()
+        .contains_key(header::SEC_WEBSOCKET_EXTENSIONS)
+    {
+        let _ = ws.close(Some(close_frame(BAD_COMPRESSION))).await;
+        return Err(ConnectError::internal(
+            "the server negotiated a WebSocket extension that was not offered",
+        ));
+    }
+    Ok(ws)
+}
+
+#[cfg(feature = "client-tls")]
+async fn tls_wrap(
+    options: &Options,
+    host: &str,
+    tcp: tokio::net::TcpStream,
+) -> Result<Box<dyn Io>, ConnectError> {
+    let Some(tls) = options.tls.clone() else {
+        return Err(no_tls());
+    };
+    let name = rustls_pki_types::ServerName::try_from(host.to_owned())
+        .map_err(|e| ConnectError::internal(format!("invalid TLS server name {host:?}: {e}")))?;
+    let stream = tokio_rustls::TlsConnector::from(tls)
+        .connect(name, tcp)
+        .await
+        .map_err(|e| ConnectError::unavailable_from_transport(e, "TLS handshake failed"))?;
+    Ok(Box::new(stream))
+}
+
+#[cfg(not(feature = "client-tls"))]
+async fn tls_wrap(
+    _options: &Options,
+    _host: &str,
+    _tcp: tokio::net::TcpStream,
+) -> Result<Box<dyn Io>, ConnectError> {
+    Err(no_tls())
+}
+
+fn no_tls() -> ConnectError {
+    ConnectError::internal(
+        "wss:// needs a TLS transport; build it with WebSocketTransport::with_tls \
+         (requires the client-tls feature)",
+    )
+}
+
+/// Map a failed handshake to the error the RPC reports. A rejected upgrade
+/// is mapped from its HTTP status as Connect maps any HTTP status.
+fn handshake_error(err: WsError) -> ConnectError {
+    match err {
+        WsError::Http(response) => {
+            let status = response.status();
+            let detail = response
+                .body()
+                .as_deref()
+                .map(String::from_utf8_lossy)
+                .map(|body| body.trim().to_owned())
+                .filter(|body| !body.is_empty())
+                .unwrap_or_else(|| status.to_string());
+            ConnectError::new(
+                crate::client::http_status_to_error_code(status),
+                format!(
+                    "WebSocket handshake rejected with HTTP {}: {detail}",
+                    status.as_u16()
+                ),
+            )
+        }
+        WsError::Io(err) => {
+            ConnectError::unavailable_from_transport(err, "WebSocket handshake failed")
+        }
+        other => ConnectError::unavailable(format!("WebSocket handshake failed: {other}")),
+    }
+}
+
+fn close_frame(code: u16) -> CloseFrame {
+    CloseFrame {
+        code: code.into(),
+        reason: "".into(),
+    }
+}
+
+type HeadSender = oneshot::Sender<Result<Response<WebSocketBody>, ConnectError>>;
+type BodySender = mpsc::Sender<Result<Bytes, ConnectError>>;
+
+/// How the session ended.
+enum End {
+    /// The server's `S` arrived and was delivered.
+    Finished,
+    /// Fail the RPC with this error, closing with this code (`None` when
+    /// the connection is already gone).
+    Fail(ConnectError, Option<u16>),
+    /// The caller dropped the call.
+    Abandoned,
+}
+
+impl From<WireError> for End {
+    fn from(err: WireError) -> Self {
+        End::Fail(err.error, Some(err.fault.close_code(Side::Client)))
+    }
+}
+
+struct Session {
+    sink: SplitSink<Socket, Message>,
+    stream: SplitStream<Socket>,
+    outbound: Outbound,
+    codec: CodecFormat,
+    max_message_size: usize,
+}
+
+/// Where the RPC's response goes.
+struct Delivery {
+    head: Option<HeadSender>,
+    body: Option<BodySender>,
+    /// A response envelope waiting for room in the caller's queue. While one
+    /// waits, the connection is not read.
+    pending: Option<Bytes>,
+}
+
+/// Request-side state: the caller's body, cut into messages one at a time.
+struct Outgoing {
+    body: Option<ClientBody>,
+    leftover: Bytes,
+    assembler: EnvelopeAssembler,
+    unary: BytesMut,
+}
+
+/// Response-side state for the messages after `M`.
+#[derive(Default)]
+struct Received {
+    headers: Option<HeaderMap>,
+    unary_message: Option<Bytes>,
+}
+
+impl Session {
+    async fn run(mut self, call: Call, metadata: Bytes, body: ClientBody, head: HeadSender) {
+        let mut delivery = Delivery {
+            head: Some(head),
+            body: None,
+            pending: None,
+        };
+        let end = self.drive(&call, metadata, body, &mut delivery).await;
+        self.finish(end, delivery).await;
+    }
+
+    async fn drive(
+        &mut self,
+        call: &Call,
+        metadata: Bytes,
+        body: ClientBody,
+        delivery: &mut Delivery,
+    ) -> End {
+        self.outbound
+            .push(wire::encode_json(Marker::Metadata, &metadata));
+        let compression = CompressionRegistry::default();
+        let mut request = Outgoing {
+            body: Some(body),
+            leftover: Bytes::new(),
+            assembler: EnvelopeAssembler::new(usize::MAX),
+            unary: BytesMut::new(),
+        };
+        let mut received = Received::default();
+        // After a failed write the server may still have sent `S` before it
+        // closed, so keep reading until the stream ends.
+        let mut write_failed = false;
+
+        loop {
+            if let Err(end) = self.pump_request(call, &compression, &mut request) {
+                return end;
+            }
+            let can_read_request =
+                !write_failed && self.outbound.is_empty() && request.leftover.is_empty();
+            tokio::select! {
+                biased;
+                () = caller_gone(delivery.head.as_mut(), delivery.body.as_ref()) => {
+                    return End::Abandoned;
+                }
+                written = std::future::poll_fn(|cx| self.outbound.poll_write(&mut self.sink, cx)),
+                    if !write_failed && self.outbound.is_busy() =>
+                {
+                    if written.is_err() {
+                        write_failed = true;
+                        self.outbound.clear();
+                        request.body = None;
+                        request.leftover = Bytes::new();
+                    }
+                }
+                permit = reserve(delivery.body.as_ref()), if delivery.pending.is_some() => {
+                    match (permit, delivery.pending.take()) {
+                        (Some(permit), Some(item)) => {
+                            permit.send(Ok(item));
+                        }
+                        _ => return End::Abandoned,
+                    }
+                }
+                message = self.stream.next(), if delivery.pending.is_none() => {
+                    let message = match message {
+                        Some(Ok(Message::Close(frame))) => return connection_lost(frame),
+                        Some(Ok(message)) => message,
+                        Some(Err(err)) => return self.read_error(err),
+                        None => return connection_lost(None),
+                    };
+                    let message = match wire::classify(message, Side::Client, self.codec) {
+                        Ok(Some(message)) => message,
+                        Ok(None) => continue,
+                        Err(err) => return err.into(),
+                    };
+                    match receive(call, &mut received, delivery, message) {
+                        Ok(false) => {}
+                        Ok(true) => return End::Finished,
+                        Err(end) => return end,
+                    }
+                }
+                frame = next_frame(&mut request.body), if can_read_request => {
+                    match frame {
+                        None => {
+                            request.body = None;
+                            if request.assembler.has_partial() {
+                                return internal(ConnectError::internal(
+                                    "the request body ended inside a message",
+                                ));
+                            }
+                            if let Err(end) = self.end_request(call, &compression, &mut request.unary) {
+                                return end;
+                            }
+                        }
+                        Some(Err(err)) => {
+                            return End::Fail(err, Some(close_code::CLIENT_INTERNAL_ERROR));
+                        }
+                        Some(Ok(frame)) => {
+                            if let Ok(data) = frame.into_data() {
+                                if call.unary {
+                                    request.unary.extend_from_slice(&data);
+                                } else {
+                                    request.leftover = data;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Queue at most one request message from the caller's body, so that a
+    /// stalled write stops the caller rather than buffering its stream.
+    fn pump_request(
+        &mut self,
+        call: &Call,
+        compression: &CompressionRegistry,
+        request: &mut Outgoing,
+    ) -> Result<(), End> {
+        if !self.outbound.is_empty() || request.leftover.is_empty() {
+            return Ok(());
+        }
+        let Some(envelope) = request
+            .assembler
+            .feed(&mut request.leftover)
+            .map_err(internal)?
+        else {
+            return Ok(());
+        };
+        let payload = if envelope.is_compressed() {
+            let encoding = call.encoding.as_deref().ok_or_else(|| {
+                internal(ConnectError::internal(
+                    "compressed request message without connect-content-encoding",
+                ))
+            })?;
+            compression
+                .decompress_with_limit(encoding, envelope.data, usize::MAX)
+                .map_err(internal)?
+        } else {
+            envelope.data
+        };
+        let message = wire::encode_body(Marker::Body, &payload, call.codec).map_err(internal)?;
+        self.outbound.push(message);
+        Ok(())
+    }
+
+    /// The request body ended: queue the unary message, then `C`.
+    fn end_request(
+        &mut self,
+        call: &Call,
+        compression: &CompressionRegistry,
+        unary: &mut BytesMut,
+    ) -> Result<(), End> {
+        if call.unary {
+            let mut payload = std::mem::take(unary).freeze();
+            if let Some(encoding) = &call.encoding {
+                payload = compression
+                    .decompress_with_limit(encoding, payload, usize::MAX)
+                    .map_err(internal)?;
+            }
+            let message =
+                wire::encode_body(Marker::Body, &payload, call.codec).map_err(internal)?;
+            self.outbound.push(message);
+        }
+        let end = wire::encode_body(Marker::ClientEnd, &[], call.codec).map_err(internal)?;
+        self.outbound.push(end);
+        Ok(())
+    }
+
+    fn read_error(&self, err: WsError) -> End {
+        match err {
+            WsError::Capacity(_) => End::from(WireError::new(
+                Side::Client,
+                Fault::TooLarge,
+                format!(
+                    "response message exceeds the {} byte limit",
+                    self.max_message_size
+                ),
+            )),
+            WsError::Utf8(_) => End::from(protocol_error("a text message is not valid UTF-8")),
+            WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => connection_lost(None),
+            WsError::Protocol(err) => End::from(protocol_error(&format!(
+                "WebSocket protocol violation: {err}"
+            ))),
+            WsError::Io(err) => End::Fail(
+                ConnectError::unavailable_from_transport(err, "WebSocket read failed"),
+                None,
+            ),
+            other => End::Fail(
+                ConnectError::unavailable(format!("WebSocket read failed: {other}")),
+                None,
+            ),
+        }
+    }
+
+    /// Close, then deliver the outcome. Closing is bounded, so a server that
+    /// stopped reading cannot keep the connection open.
+    async fn finish(mut self, end: End, mut delivery: Delivery) {
+        // Request messages not yet handed to the socket are moot once the
+        // RPC is over.
+        self.outbound.clear();
+        let (error, close) = match end {
+            End::Finished => (None, Some(close_code::NORMAL)),
+            End::Fail(err, close) => (Some(err), close),
+            End::Abandoned => (None, Some(close_code::NORMAL)),
+        };
+        if let Some(code) = close {
+            self.outbound.push(Message::Close(Some(close_frame(code))));
+            let written = tokio::time::timeout(
+                crate::service::DRAIN_TIMEOUT,
+                self.outbound.write(&mut self.sink),
+            )
+            .await;
+            if matches!(written, Ok(Ok(()))) {
+                let _ = tokio::time::timeout(crate::service::DRAIN_TIMEOUT, async {
+                    while let Some(Ok(_)) = self.stream.next().await {}
+                })
+                .await;
+            }
+        }
+        drop(self);
+        deliver(&mut delivery, error).await;
+    }
+}
+
+/// Hand the caller what is still queued, then the error, if any: through
+/// the head while the caller still awaits it, through the body after. The
+/// connection is closed by now, so this waits for as long as the caller
+/// holds the stream.
+async fn deliver(delivery: &mut Delivery, error: Option<ConnectError>) {
+    if let Some(head) = delivery.head.take() {
+        if let Some(error) = error {
+            let _ = head.send(Err(error));
+        }
+        return;
+    }
+    let Some(body) = delivery.body.take() else {
+        return;
+    };
+    let pending = delivery.pending.take();
+    let send_all = async {
+        if let Some(item) = pending {
+            body.send(Ok(item)).await.ok()?;
+        }
+        if let Some(error) = error {
+            body.send(Err(error)).await.ok()?;
+        }
+        Some(())
+    };
+    tokio::select! {
+        _ = send_all => {}
+        () = body.closed() => {}
+    }
+}
+
+/// Take one message from the server. `Ok(true)` once `S` has been handed on.
+fn receive(
+    call: &Call,
+    received: &mut Received,
+    delivery: &mut Delivery,
+    message: wire::WireMessage,
+) -> Result<bool, End> {
+    let Some(headers) = &received.headers else {
+        if message.marker != Marker::Metadata {
+            return Err(protocol_error(
+                "the first message must be a Leading-Metadata ('M') message",
+            )
+            .into());
+        }
+        let headers = metadata_headers(&message.payload)?;
+        if !call.unary {
+            let (tx, rx) = mpsc::channel(RESPONSE_QUEUE);
+            let response = streaming_head(&headers, call.codec, rx);
+            let delivered = delivery
+                .head
+                .take()
+                .is_some_and(|head| head.send(Ok(response)).is_ok());
+            if !delivered {
+                return Err(End::Abandoned);
+            }
+            delivery.body = Some(tx);
+        }
+        received.headers = Some(headers);
+        return Ok(false);
+    };
+    match message.marker {
+        Marker::Metadata => Err(protocol_error("a second Leading-Metadata ('M') message").into()),
+        Marker::Body if call.unary => {
+            if received.unary_message.is_some() {
+                return Err(protocol_error("a unary response with more than one message").into());
+            }
+            received.unary_message = Some(message.payload);
+            Ok(false)
+        }
+        Marker::Body => {
+            let item = wire::envelope(flags::DATA, &message.payload).map_err(internal)?;
+            delivery.pending = offer(delivery.body.as_ref(), item);
+            Ok(false)
+        }
+        Marker::ServerEnd if call.unary => {
+            let response = unary_response(
+                headers.clone(),
+                &message.payload,
+                received.unary_message.take(),
+                call.codec,
+            );
+            if let Some(head) = delivery.head.take() {
+                let _ = head.send(response);
+            }
+            Ok(true)
+        }
+        Marker::ServerEnd => {
+            if let Err(error) = crate::client::parse_connect_end_stream(&message.payload) {
+                return Err(WireError {
+                    fault: Fault::Protocol,
+                    error,
+                }
+                .into());
+            }
+            let item = wire::envelope(flags::END_STREAM, &message.payload).map_err(internal)?;
+            delivery.pending = offer(delivery.body.as_ref(), item);
+            Ok(true)
+        }
+        Marker::ClientEnd => Err(protocol_error("'C' is not valid from a server").into()),
+    }
+}
+
+fn protocol_error(message: &str) -> WireError {
+    WireError::new(Side::Client, Fault::Protocol, message)
+}
+
+fn internal(err: ConnectError) -> End {
+    End::Fail(err, Some(close_code::CLIENT_INTERNAL_ERROR))
+}
+
+/// The connection ended without the server's `S` (§13.1), which always
+/// fails the RPC, whatever the close code.
+fn connection_lost(frame: Option<CloseFrame>) -> End {
+    let message = match frame {
+        Some(frame) if frame.reason.is_empty() => format!(
+            "the WebSocket closed with code {} before the end of the response",
+            u16::from(frame.code)
+        ),
+        Some(frame) => format!(
+            "the WebSocket closed with code {} ({}) before the end of the response",
+            u16::from(frame.code),
+            frame.reason
+        ),
+        None => "the WebSocket connection ended before the end of the response".to_owned(),
+    };
+    End::Fail(ConnectError::unavailable(message), None)
+}
+
+fn metadata_headers(payload: &[u8]) -> Result<HeaderMap, WireError> {
+    let mut headers = HeaderMap::new();
+    for (name, values) in decode_metadata(payload, Side::Client)? {
+        for value in values {
+            headers.append(name.clone(), value);
+        }
+    }
+    Ok(headers)
+}
+
+fn streaming_head(
+    headers: &HeaderMap,
+    codec: CodecFormat,
+    rx: mpsc::Receiver<Result<Bytes, ConnectError>>,
+) -> Response<WebSocketBody> {
+    let mut response = Response::new(WebSocketBody {
+        inner: BodyInner::Stream(rx),
+    });
+    *response.headers_mut() = headers.clone();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(Protocol::Connect.response_content_type(codec, true)),
+    );
+    response
+}
+
+/// Rebuild what a Connect unary response would have been: `S`'s metadata
+/// as `trailer-` headers on success, or the error itself, which the call
+/// path surfaces verbatim.
+fn unary_response(
+    headers: HeaderMap,
+    end: &[u8],
+    message: Option<Bytes>,
+    codec: CodecFormat,
+) -> Result<Response<WebSocketBody>, ConnectError> {
+    let end = crate::client::parse_connect_end_stream(end)?;
+    let mut trailers = HeaderMap::new();
+    if let Some(metadata) = end.metadata {
+        crate::client::append_metadata_capped(&mut trailers, metadata);
+    }
+    if let Some(err) = end.error {
+        return Err(crate::client::end_stream_error_to_connect_error(err)
+            .with_headers(headers)
+            .with_trailers(trailers));
+    }
+    let message = message.ok_or_else(|| {
+        ConnectError::new(
+            ErrorCode::Unimplemented,
+            "the server ended a unary RPC without a response message",
+        )
+    })?;
+    let mut response = Response::new(WebSocketBody {
+        inner: BodyInner::Full(Some(message)),
+    });
+    *response.status_mut() = StatusCode::OK;
+    *response.headers_mut() = headers;
+    for (name, value) in &trailers {
+        if let Ok(name) = HeaderName::from_bytes(format!("trailer-{name}").as_bytes()) {
+            response.headers_mut().append(name, value.clone());
+        }
+    }
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(codec.content_type()),
+    );
+    Ok(response)
+}
+
+fn offer(tx: Option<&BodySender>, item: Bytes) -> Option<Bytes> {
+    match tx?.try_send(Ok(item)) {
+        Err(mpsc::error::TrySendError::Full(Ok(item))) => Some(item),
+        _ => None,
+    }
+}
+
+async fn reserve(
+    tx: Option<&BodySender>,
+) -> Option<mpsc::OwnedPermit<Result<Bytes, ConnectError>>> {
+    tx?.clone().reserve_owned().await.ok()
+}
+
+async fn next_frame(body: &mut Option<ClientBody>) -> Option<Result<Frame<Bytes>, ConnectError>> {
+    match body {
+        Some(body) => body.frame().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Resolves once nobody is waiting for the RPC's response any more.
+async fn caller_gone(head: Option<&mut HeadSender>, body: Option<&BodySender>) {
+    if let Some(head) = head {
+        head.closed().await;
+    } else if let Some(body) = body {
+        body.closed().await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn websocket_uri_maps_scheme_prefix_and_timeout() {
+        let uri: Uri = "http://localhost:8080/api/pkg.Svc/Method".parse().unwrap();
+        assert_eq!(
+            websocket_uri(&uri, None, None).unwrap(),
+            "ws://localhost:8080/api/pkg.Svc/Method"
+        );
+        assert_eq!(
+            websocket_uri(&uri, Some("/ws"), Some("1500")).unwrap(),
+            "ws://localhost:8080/api/ws/pkg.Svc/Method?connect-timeout-ms=1500"
+        );
+        let uri: Uri = "https://example.com/pkg.Svc/Method".parse().unwrap();
+        assert_eq!(
+            websocket_uri(&uri, Some("/ws"), None).unwrap(),
+            "wss://example.com/ws/pkg.Svc/Method"
+        );
+        let uri: Uri = "ftp://example.com/pkg.Svc/Method".parse().unwrap();
+        assert!(websocket_uri(&uri, None, None).is_err());
+    }
+
+    #[test]
+    fn unary_response_maps_success_and_error() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-head", HeaderValue::from_static("1"));
+        let response = unary_response(
+            headers.clone(),
+            br#"{"metadata":{"x-tail":["2"]}}"#,
+            Some(Bytes::from_static(b"\x08\x01")),
+            CodecFormat::Proto,
+        )
+        .unwrap();
+        assert_eq!(response.headers()["x-head"], "1");
+        assert_eq!(response.headers()["trailer-x-tail"], "2");
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/proto"
+        );
+
+        let err = unary_response(
+            headers.clone(),
+            br#"{"error":{"code":"not_found","message":"gone"},"metadata":{"x-tail":["2"]}}"#,
+            None,
+            CodecFormat::Proto,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert_eq!(err.response_headers()["x-head"], "1");
+        assert_eq!(err.trailers()["x-tail"], "2");
+
+        let err = unary_response(headers, b"{}", None, CodecFormat::Proto).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unimplemented);
+    }
+
+    #[test]
+    fn request_headers_skip_protocol_names() {
+        for name in [
+            "content-type",
+            "connect-timeout-ms",
+            "accept-encoding",
+            "host",
+        ] {
+            assert!(
+                skip_request_header(&HeaderName::from_static(name)),
+                "{name}"
+            );
+        }
+        assert!(!skip_request_header(&HeaderName::from_static(
+            "authorization"
+        )));
+    }
+}

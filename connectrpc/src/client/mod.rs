@@ -4877,14 +4877,14 @@ fn scan_connect_client_stream_envelopes(
 
 /// EndStreamResponse as received by the client.
 #[derive(serde::Deserialize)]
-struct ClientEndStreamResponse {
-    error: Option<ClientEndStreamError>,
-    metadata: Option<HashMap<String, Vec<String>>>,
+pub(crate) struct ClientEndStreamResponse {
+    pub(crate) error: Option<ClientEndStreamError>,
+    pub(crate) metadata: Option<HashMap<String, Vec<String>>>,
 }
 
 /// Error in the EndStreamResponse.
 #[derive(serde::Deserialize)]
-struct ClientEndStreamError {
+pub(crate) struct ClientEndStreamError {
     code: Option<String>,
     message: Option<String>,
     #[serde(default)]
@@ -4894,7 +4894,9 @@ struct ClientEndStreamError {
 /// Parse the body of a Connect END_STREAM envelope. A malformed body is a
 /// wire-protocol violation, so it surfaces as `Internal` (matching connect-go)
 /// rather than being silently treated as a clean close.
-fn parse_connect_end_stream(data: &[u8]) -> Result<ClientEndStreamResponse, ConnectError> {
+pub(crate) fn parse_connect_end_stream(
+    data: &[u8],
+) -> Result<ClientEndStreamResponse, ConnectError> {
     serde_json::from_slice(data).map_err(|e| {
         ConnectError::internal(format!(
             "protocol error: malformed Connect END_STREAM JSON: {e}"
@@ -4904,7 +4906,7 @@ fn parse_connect_end_stream(data: &[u8]) -> Result<ClientEndStreamResponse, Conn
 
 /// Convert the `error` member of a Connect END_STREAM body into the
 /// caller-facing [`ConnectError`], with `Unknown` as the fallback code.
-fn end_stream_error_to_connect_error(err: ClientEndStreamError) -> ConnectError {
+pub(crate) fn end_stream_error_to_connect_error(err: ClientEndStreamError) -> ConnectError {
     let mut connect_error = ConnectError::new(
         err.code
             .as_deref()
@@ -4958,7 +4960,7 @@ fn body_parse_error(
     err
 }
 
-fn http_status_to_error_code(status: http::StatusCode) -> ErrorCode {
+pub(crate) fn http_status_to_error_code(status: http::StatusCode) -> ErrorCode {
     match status.as_u16() {
         400 => ErrorCode::Internal,
         401 => ErrorCode::Unauthenticated,
@@ -5349,7 +5351,10 @@ fn parse_grpc_web_trailer_payload(
 /// hostile server could send tens of thousands of distinct keys in a few
 /// hundred KB of JSON and crash the RPC task. Use the fallible `try_append`
 /// and stop at the ceiling instead.
-fn append_metadata_capped(trailers: &mut http::HeaderMap, metadata: HashMap<String, Vec<String>>) {
+pub(crate) fn append_metadata_capped(
+    trailers: &mut http::HeaderMap,
+    metadata: HashMap<String, Vec<String>>,
+) {
     'outer: for (name, values) in metadata {
         for value in values {
             if let (Ok(name), Ok(value)) = (

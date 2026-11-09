@@ -47,6 +47,13 @@
 //! `serve_connection`, turn it off with
 //! `ConnectionConfig::with_http2_extended_connect`.
 //!
+//! # Client
+//!
+//! With the `client` feature, `WebSocketTransport` is a
+//! [`ClientTransport`](crate::client::ClientTransport) for generated
+//! clients. It carries every RPC kind, unary included, over its own
+//! WebSocket connection. It is native only.
+//!
 //! # What is not supported
 //!
 //! - `permessage-deflate`: no compression is negotiated in either
@@ -55,6 +62,8 @@
 //!   handshake must be HTTP/1.1.
 //! - Without the `json` feature only `connectrpc.1+proto` is served; a
 //!   `connectrpc.1+json` client gets `unimplemented`.
+//! - The client transport is not built for `wasm32`. In a browser, use the
+//!   browser's own `WebSocket` through a JavaScript Connect client.
 //!
 //! [`Interceptor`]: crate::Interceptor
 
@@ -63,6 +72,12 @@ use std::time::Duration;
 
 pub(crate) mod server;
 mod wire;
+
+#[cfg(all(feature = "client", not(target_arch = "wasm32")))]
+mod client;
+#[cfg(all(feature = "client", not(target_arch = "wasm32")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
+pub use client::{DEFAULT_HANDSHAKE_TIMEOUT, WebSocketBody, WebSocketTransport};
 
 #[cfg(all(test, feature = "server", feature = "json"))]
 mod e2e;

@@ -42,7 +42,7 @@ impl Marker {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Side {
     Server,
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     Client,
 }
 
@@ -100,7 +100,7 @@ pub(crate) mod close_code {
     pub(crate) const UNSUPPORTED_DATA: u16 = 1003;
     pub(crate) const MESSAGE_TOO_BIG: u16 = 1009;
     pub(crate) const INTERNAL_ERROR: u16 = 1011;
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     pub(crate) const CLIENT_INTERNAL_ERROR: u16 = 3111;
 }
 
@@ -256,7 +256,7 @@ impl Outbound {
     }
 
     /// Drop what has not been handed to the sink yet.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     pub(crate) fn clear(&mut self) {
         self.queue.clear();
     }
