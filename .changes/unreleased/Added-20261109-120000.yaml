@@ -1,0 +1,11 @@
+kind: Added
+body: |-
+    Connect over WebSocket, behind the new `websocket` feature.
+    `ConnectRpcService::with_websocket` (and `Server::with_websocket`) serves
+    every registered procedure over WebSocket as well as HTTP, and
+    `websocket::WebSocketTransport` is a client transport that carries any
+    RPC kind, including full-duplex bidi, over its own WebSocket connection.
+    `ConnectionConfig::with_http2_extended_connect` turns off the RFC 8441
+    advertisement, which `Server` now does for a service with WebSocket
+    enabled.
+time: 2026-11-09T12:00:00.000000000+00:00
