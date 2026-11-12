@@ -33,7 +33,6 @@ use tokio::time::Instant;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
-use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig as FrameConfig};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tower::Service;
@@ -654,7 +653,11 @@ impl Session {
                 Fault::TooLarge,
                 format!("message exceeds the {} byte limit", self.max_message_size),
             )),
-            WsError::Utf8(_) => protocol_error("a text message is not valid UTF-8").into(),
+            WsError::Utf8(_) => End::from(WireError::new(
+                Side::Server,
+                Fault::Encoding,
+                "a text message is not valid UTF-8",
+            )),
             WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => End::Canceled,
             WsError::Protocol(err) => {
                 protocol_error(&format!("WebSocket protocol violation: {err}")).into()
@@ -672,8 +675,11 @@ impl Session {
         };
         let close = match end {
             End::Canceled => None,
-            End::Finished => Some(close_code::NORMAL),
-            End::Silent => Some(close_code::INTERNAL_ERROR),
+            End::Finished => Some(wire::close_frame(close_code::NORMAL, "")),
+            End::Silent => Some(wire::close_frame(
+                close_code::INTERNAL_ERROR,
+                "the client stopped responding",
+            )),
             End::Fail(err, code) => {
                 if !self.sent_metadata {
                     self.outbound
@@ -683,15 +689,19 @@ impl Session {
                     Marker::ServerEnd,
                     &end_stream_error_json(&err),
                 ));
-                Some(code)
+                Some(wire::close_frame(
+                    code,
+                    err.message.as_deref().unwrap_or_default(),
+                ))
             }
         };
-        if let Some(code) = close {
-            self.outbound.push(Message::Close(Some(close_frame(code))));
+        let closing = close.is_some();
+        if let Some(frame) = close {
+            self.outbound.push(Message::Close(Some(frame)));
         }
         let written =
             tokio::time::timeout(DRAIN_TIMEOUT, self.outbound.write(&mut self.sink)).await;
-        if matches!(written, Ok(Ok(()))) || close.is_none() {
+        if matches!(written, Ok(Ok(()))) || !closing {
             self.drain().await;
         }
     }
@@ -735,13 +745,6 @@ fn receive(inbound: &mut Inbound, message: wire::WireMessage) -> Result<(), End>
 
 fn protocol_error(message: &str) -> WireError {
     WireError::new(Side::Server, Fault::Protocol, message)
-}
-
-fn close_frame(code: u16) -> CloseFrame {
-    CloseFrame {
-        code: code.into(),
-        reason: "".into(),
-    }
 }
 
 /// Build the request the service dispatches: the handshake's headers under

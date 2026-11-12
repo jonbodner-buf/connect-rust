@@ -52,7 +52,32 @@
 //! With the `client` feature, `WebSocketTransport` is a
 //! [`ClientTransport`](crate::client::ClientTransport) for generated
 //! clients. It carries every RPC kind, unary included, over its own
-//! WebSocket connection. It is native only.
+//! WebSocket connection.
+//!
+//! # Close codes and errors
+//!
+//! The server ends every RPC whose client is still connected with an `S`
+//! message, and closes with:
+//!
+//! - 1000 after a normal end, an error from the handler, or an RPC refused
+//!   in-band (a bad `connect-timeout-ms`, an unsupported codec, a deadline);
+//! - 1002 after a protocol error by the client, 1003 after a body in the
+//!   wrong frame type, 1007 after a text message that is not UTF-8, and 1009
+//!   after an oversized message;
+//! - 1011 after a failure inside the server (a handler panic or a malformed
+//!   response from the service), and, with no `S`, for a client that
+//!   stopped answering Pings.
+//!
+//! The `S` reports a client's protocol mistake as `invalid_argument`, and an
+//! oversized message as `resource_exhausted`.
+//!
+//! The client transport closes with 1000, or with 3102 on any failure,
+//! since a browser cannot send the 10xx codes. When the server broke the
+//! protocol, the Close reason says how and the RPC fails with `internal`
+//! (`resource_exhausted` for an oversized message, which a streaming RPC
+//! reports as the cause of an `internal` error; see `WebSocketBody`);
+//! for a failure on the client's side the reason is only "client error".
+//! A connection that ends without `S` fails the RPC with `unavailable`.
 //!
 //! # What is not supported
 //!

@@ -47,10 +47,6 @@ pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// stops reading the connection.
 const RESPONSE_QUEUE: usize = 2;
 
-/// The close code a client sends when the server negotiated an extension
-/// this binding forbids (§10).
-const BAD_COMPRESSION: u16 = 3110;
-
 /// A [`ClientTransport`] that carries Connect RPCs over WebSocket, one
 /// connection per RPC.
 ///
@@ -82,6 +78,12 @@ const BAD_COMPRESSION: u16 = 3110;
 ///
 /// Native targets only; in a browser, use the browser's `WebSocket` through
 /// a JavaScript Connect client.
+///
+/// To pick between this and an HTTP transport per client, wrap both in one
+/// [`ClientTransport`] whose body is `http_body_util::Either` of the two
+/// bodies. Keep this transport's [`ConnectError`] as the wrapper error itself
+/// or in its [`source`](std::error::Error::source) chain, so the call path
+/// surfaces the RPC's code rather than `unavailable`.
 ///
 /// [`ClientConfig`]: crate::client::ClientConfig
 #[derive(Clone)]
@@ -191,6 +193,14 @@ impl ClientTransport for WebSocketTransport {
 /// For a streaming RPC it yields the server's messages as Connect envelopes,
 /// ending with the end-of-stream envelope; for a unary RPC it is the single
 /// response message. A failure on the connection is its error.
+///
+/// A unary RPC reports such a failure from the transport's `send`, so its
+/// code reaches the caller as is. A streaming RPC reports it while reading
+/// this body, and the client call path reports every body read failure as
+/// `internal` (or `deadline_exceeded` past the deadline), keeping this
+/// body's [`ConnectError`] as its [source](std::error::Error::source). An
+/// oversized response message is `resource_exhausted` on a unary RPC and
+/// `internal`, caused by `resource_exhausted`, on a streaming one.
 pub struct WebSocketBody {
     inner: BodyInner,
 }
@@ -413,10 +423,11 @@ async fn connect(options: &Options, uri: Uri, codec: CodecFormat) -> Result<Sock
         .headers()
         .contains_key(header::SEC_WEBSOCKET_EXTENSIONS)
     {
-        let _ = ws.close(Some(close_frame(BAD_COMPRESSION))).await;
-        return Err(ConnectError::internal(
-            "the server negotiated a WebSocket extension that was not offered",
-        ));
+        let message = "the server negotiated a WebSocket extension that was not offered";
+        let _ = ws
+            .close(Some(wire::close_frame(close_code::CLIENT_ERROR, message)))
+            .await;
+        return Err(ConnectError::internal(message));
     }
     Ok(ws)
 }
@@ -483,13 +494,6 @@ fn handshake_error(err: WsError) -> ConnectError {
     }
 }
 
-fn close_frame(code: u16) -> CloseFrame {
-    CloseFrame {
-        code: code.into(),
-        reason: "".into(),
-    }
-}
-
 type HeadSender = oneshot::Sender<Result<Response<WebSocketBody>, ConnectError>>;
 type BodySender = mpsc::Sender<Result<Bytes, ConnectError>>;
 
@@ -500,13 +504,16 @@ enum End {
     /// Fail the RPC with this error, closing with this code (`None` when
     /// the connection is already gone).
     Fail(ConnectError, Option<u16>),
+    /// The server broke the protocol: fail the RPC with this error and close
+    /// with 3102, telling the server why.
+    Fault(ConnectError),
     /// The caller dropped the call.
     Abandoned,
 }
 
 impl From<WireError> for End {
     fn from(err: WireError) -> Self {
-        End::Fail(err.error, Some(err.fault.close_code(Side::Client)))
+        End::Fault(err.error)
     }
 }
 
@@ -635,7 +642,7 @@ impl Session {
                             }
                         }
                         Some(Err(err)) => {
-                            return End::Fail(err, Some(close_code::CLIENT_INTERNAL_ERROR));
+                            return End::Fail(err, Some(close_code::CLIENT_ERROR));
                         }
                         Some(Ok(frame)) => {
                             if let Ok(data) = frame.into_data() {
@@ -720,7 +727,11 @@ impl Session {
                     self.max_message_size
                 ),
             )),
-            WsError::Utf8(_) => End::from(protocol_error("a text message is not valid UTF-8")),
+            WsError::Utf8(_) => End::from(WireError::new(
+                Side::Client,
+                Fault::Encoding,
+                "a text message is not valid UTF-8",
+            )),
             WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => connection_lost(None),
             WsError::Protocol(err) => End::from(protocol_error(&format!(
                 "WebSocket protocol violation: {err}"
@@ -742,13 +753,23 @@ impl Session {
         // Request messages not yet handed to the socket are moot once the
         // RPC is over.
         self.outbound.clear();
+        // Only a fault the server caused is explained to it; a local
+        // failure's message may hold the caller's own data.
         let (error, close) = match end {
-            End::Finished => (None, Some(close_code::NORMAL)),
-            End::Fail(err, close) => (Some(err), close),
-            End::Abandoned => (None, Some(close_code::NORMAL)),
+            End::Finished => (None, Some((close_code::NORMAL, String::new()))),
+            End::Fail(err, close) => (
+                Some(err),
+                close.map(|code| (code, "client error".to_owned())),
+            ),
+            End::Fault(err) => {
+                let reason = err.message.clone().unwrap_or_default();
+                (Some(err), Some((close_code::CLIENT_ERROR, reason)))
+            }
+            End::Abandoned => (None, Some((close_code::NORMAL, String::new()))),
         };
-        if let Some(code) = close {
-            self.outbound.push(Message::Close(Some(close_frame(code))));
+        if let Some((code, reason)) = close {
+            let frame = wire::close_frame(code, &reason);
+            self.outbound.push(Message::Close(Some(frame)));
             let written = tokio::time::timeout(
                 crate::service::DRAIN_TIMEOUT,
                 self.outbound.write(&mut self.sink),
@@ -841,9 +862,16 @@ fn receive(
             Ok(false)
         }
         Marker::ServerEnd if call.unary => {
+            let end =
+                crate::client::parse_connect_end_stream(&message.payload).map_err(|error| {
+                    WireError {
+                        fault: Fault::Protocol,
+                        error,
+                    }
+                })?;
             let response = unary_response(
                 headers.clone(),
-                &message.payload,
+                end,
                 received.unary_message.take(),
                 call.codec,
             );
@@ -853,13 +881,12 @@ fn receive(
             Ok(true)
         }
         Marker::ServerEnd => {
-            if let Err(error) = crate::client::parse_connect_end_stream(&message.payload) {
-                return Err(WireError {
+            crate::client::parse_connect_end_stream(&message.payload).map_err(|error| {
+                WireError {
                     fault: Fault::Protocol,
                     error,
                 }
-                .into());
-            }
+            })?;
             let item = wire::envelope(flags::END_STREAM, &message.payload).map_err(internal)?;
             delivery.pending = offer(delivery.body.as_ref(), item);
             Ok(true)
@@ -873,7 +900,7 @@ fn protocol_error(message: &str) -> WireError {
 }
 
 fn internal(err: ConnectError) -> End {
-    End::Fail(err, Some(close_code::CLIENT_INTERNAL_ERROR))
+    End::Fail(err, Some(close_code::CLIENT_ERROR))
 }
 
 /// The connection ended without the server's `S` (§13.1), which always
@@ -925,11 +952,10 @@ fn streaming_head(
 /// path surfaces verbatim.
 fn unary_response(
     headers: HeaderMap,
-    end: &[u8],
+    end: crate::client::ClientEndStreamResponse,
     message: Option<Bytes>,
     codec: CodecFormat,
 ) -> Result<Response<WebSocketBody>, ConnectError> {
-    let end = crate::client::parse_connect_end_stream(end)?;
     let mut trailers = HeaderMap::new();
     if let Some(metadata) = end.metadata {
         crate::client::append_metadata_capped(&mut trailers, metadata);
@@ -1021,9 +1047,10 @@ mod tests {
     fn unary_response_maps_success_and_error() {
         let mut headers = HeaderMap::new();
         headers.insert("x-head", HeaderValue::from_static("1"));
+        let end = |json: &[u8]| crate::client::parse_connect_end_stream(json).unwrap();
         let response = unary_response(
             headers.clone(),
-            br#"{"metadata":{"x-tail":["2"]}}"#,
+            end(br#"{"metadata":{"x-tail":["2"]}}"#),
             Some(Bytes::from_static(b"\x08\x01")),
             CodecFormat::Proto,
         )
@@ -1037,7 +1064,7 @@ mod tests {
 
         let err = unary_response(
             headers.clone(),
-            br#"{"error":{"code":"not_found","message":"gone"},"metadata":{"x-tail":["2"]}}"#,
+            end(br#"{"error":{"code":"not_found","message":"gone"},"metadata":{"x-tail":["2"]}}"#),
             None,
             CodecFormat::Proto,
         )
@@ -1046,7 +1073,7 @@ mod tests {
         assert_eq!(err.response_headers()["x-head"], "1");
         assert_eq!(err.trailers()["x-tail"], "2");
 
-        let err = unary_response(headers, b"{}", None, CodecFormat::Proto).unwrap_err();
+        let err = unary_response(headers, end(b"{}"), None, CodecFormat::Proto).unwrap_err();
         assert_eq!(err.code, ErrorCode::Unimplemented);
     }
 

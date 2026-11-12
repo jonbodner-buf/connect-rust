@@ -11,7 +11,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use futures::{Sink, SinkExt};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use serde::de::{Deserializer, MapAccess, Visitor};
-use tokio_tungstenite::tungstenite::protocol::frame::Utf8Bytes;
+use tokio_tungstenite::tungstenite::protocol::frame::{CloseFrame, Utf8Bytes};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use crate::codec::CodecFormat;
@@ -51,21 +51,21 @@ pub(crate) enum Side {
 pub(crate) enum Fault {
     Protocol,
     FrameType,
+    Encoding,
     TooLarge,
 }
 
 impl Fault {
-    /// The close code the reading side sends for this fault: the 10xx code
-    /// from a server, the 31xx code (which browsers can send) from a client.
+    /// The close code the reading side sends for this fault. A server picks
+    /// the most specific 10xx code; a client, which in a browser cannot send
+    /// 10xx codes, always sends 3102 (§13).
     pub(crate) fn close_code(self, side: Side) -> u16 {
-        let base = match self {
-            Self::Protocol => close_code::PROTOCOL_ERROR,
-            Self::FrameType => close_code::UNSUPPORTED_DATA,
-            Self::TooLarge => close_code::MESSAGE_TOO_BIG,
-        };
-        match side {
-            Side::Server => base,
-            Side::Client => base + 2100,
+        match (side, self) {
+            (Side::Client, _) => close_code::CLIENT_ERROR,
+            (Side::Server, Self::Protocol) => close_code::PROTOCOL_ERROR,
+            (Side::Server, Self::FrameType) => close_code::UNSUPPORTED_DATA,
+            (Side::Server, Self::Encoding) => close_code::INVALID_PAYLOAD,
+            (Side::Server, Self::TooLarge) => close_code::MESSAGE_TOO_BIG,
         }
     }
 }
@@ -98,10 +98,27 @@ pub(crate) mod close_code {
     pub(crate) const NORMAL: u16 = 1000;
     pub(crate) const PROTOCOL_ERROR: u16 = 1002;
     pub(crate) const UNSUPPORTED_DATA: u16 = 1003;
+    pub(crate) const INVALID_PAYLOAD: u16 = 1007;
     pub(crate) const MESSAGE_TOO_BIG: u16 = 1009;
     pub(crate) const INTERNAL_ERROR: u16 = 1011;
-    #[cfg_attr(not(feature = "client"), allow(dead_code))]
-    pub(crate) const CLIENT_INTERNAL_ERROR: u16 = 3111;
+    /// The only error code a client sends (§13).
+    pub(crate) const CLIENT_ERROR: u16 = 3102;
+}
+
+/// The longest Close-frame reason RFC 6455 allows, in bytes.
+const MAX_CLOSE_REASON: usize = 123;
+
+/// A Close frame with `code`, and `reason` cut to the length the frame can
+/// carry without splitting a character.
+pub(crate) fn close_frame(code: u16, reason: &str) -> CloseFrame {
+    let mut end = reason.len().min(MAX_CLOSE_REASON);
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    CloseFrame {
+        code: code.into(),
+        reason: reason[..end].into(),
+    }
 }
 
 /// One application message with its marker removed.
@@ -670,11 +687,37 @@ mod tests {
     #[test]
     fn close_codes_follow_the_side() {
         assert_eq!(Fault::Protocol.close_code(Side::Server), 1002);
-        assert_eq!(Fault::Protocol.close_code(Side::Client), 3102);
         assert_eq!(Fault::FrameType.close_code(Side::Server), 1003);
-        assert_eq!(Fault::FrameType.close_code(Side::Client), 3103);
+        assert_eq!(Fault::Encoding.close_code(Side::Server), 1007);
         assert_eq!(Fault::TooLarge.close_code(Side::Server), 1009);
-        assert_eq!(Fault::TooLarge.close_code(Side::Client), 3109);
+        for fault in [
+            Fault::Protocol,
+            Fault::FrameType,
+            Fault::Encoding,
+            Fault::TooLarge,
+        ] {
+            assert_eq!(fault.close_code(Side::Client), 3102);
+        }
+    }
+
+    #[test]
+    fn close_reason_fits_the_frame() {
+        let frame = close_frame(3102, "short");
+        assert_eq!(frame.reason.as_str(), "short");
+        let long = "é".repeat(100);
+        let frame = close_frame(3102, &long);
+        assert!(frame.reason.len() <= 123);
+        assert!(long.starts_with(frame.reason.as_str()));
+
+        let exact = "a".repeat(123);
+        assert_eq!(close_frame(1002, &exact).reason.as_str(), exact);
+        // A four-byte character that would straddle byte 123 is dropped whole.
+        let straddle = format!("{}🦀", "a".repeat(121));
+        assert_eq!(
+            close_frame(1002, &straddle).reason.as_str(),
+            "a".repeat(121)
+        );
+        assert_eq!(close_frame(1000, "").reason.as_str(), "");
     }
 
     #[test]

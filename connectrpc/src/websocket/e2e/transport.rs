@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use buffa_types::google::protobuf::__buffa::view::StringValueView;
 use buffa_types::google::protobuf::StringValue;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 
 use super::{raw_http_status, serve};
 use crate::ErrorCode;
@@ -21,6 +21,27 @@ fn client_config(addr: SocketAddr) -> ClientConfig {
 
 fn spec(method: &'static str, stream_type: StreamType) -> Spec {
     Spec::client(method, stream_type)
+}
+
+// A hand-driven server for the proto codec. tungstenite fixes the
+// callback's error type, so the large error cannot be avoided.
+#[allow(clippy::result_large_err)]
+async fn accept_proto(
+    listener: &tokio::net::TcpListener,
+) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
+    let (tcp, _) = listener.accept().await.unwrap();
+    let callback =
+        |_: &tokio_tungstenite::tungstenite::handshake::server::Request,
+         mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+            response.headers_mut().insert(
+                "sec-websocket-protocol",
+                http::HeaderValue::from_static("connectrpc.1+proto"),
+            );
+            Ok(response)
+        };
+    tokio_tungstenite::accept_hdr_async(tcp, callback)
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -181,26 +202,13 @@ async fn unknown_procedure_is_unimplemented_in_band() {
     assert_eq!(err.code, ErrorCode::Unimplemented);
 }
 
-// tungstenite fixes the callback's error type.
-#[allow(clippy::result_large_err)]
 #[tokio::test]
 async fn client_reports_a_server_that_closes_without_s() {
     // A server that accepts the upgrade and hangs up straight away.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let (tcp, _) = listener.accept().await.unwrap();
-        let callback = |_: &tokio_tungstenite::tungstenite::handshake::server::Request,
-                        mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
-            response.headers_mut().insert(
-                "sec-websocket-protocol",
-                http::HeaderValue::from_static("connectrpc.1+proto"),
-            );
-            Ok(response)
-        };
-        let mut ws = tokio_tungstenite::accept_hdr_async(tcp, callback)
-            .await
-            .unwrap();
+        let mut ws = accept_proto(&listener).await;
         let _ = ws.next().await;
         let _ = ws.close(None).await;
     });
@@ -214,6 +222,119 @@ async fn client_reports_a_server_that_closes_without_s() {
     .await
     .unwrap_err();
     assert_eq!(err.code, ErrorCode::Unavailable, "{err}");
+}
+
+#[tokio::test]
+async fn client_closes_with_3102_and_a_reason_on_a_malformed_end_stream() {
+    use tokio_tungstenite::tungstenite::Message;
+
+    // A server that answers a unary call with an S that is not JSON, then
+    // reports the client's Close frame.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let mut ws = accept_proto(&listener).await;
+        let _ = ws.send(Message::Text("M{}".into())).await;
+        let _ = ws.send(Message::Text("Snot json".into())).await;
+        while let Some(Ok(message)) = ws.next().await {
+            if let Message::Close(frame) = message {
+                let _ = close_tx.send(frame);
+                break;
+            }
+        }
+    });
+    let err = call_unary::<_, _, StringValueView<'static>>(
+        &WebSocketTransport::plaintext(),
+        &client_config(addr),
+        spec("/test.v1.EchoService/Echo", StreamType::Unary),
+        StringValue::from("x"),
+        CallOptions::default(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Internal, "{err}");
+    let frame = close_rx.await.unwrap().expect("a Close frame with a code");
+    assert_eq!(u16::from(frame.code), 3102);
+    assert!(!frame.reason.is_empty());
+}
+
+#[tokio::test]
+async fn a_local_failure_is_not_explained_to_the_server() {
+    use http_body_util::BodyExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    use crate::client::ClientTransport;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let mut ws = accept_proto(&listener).await;
+        while let Some(Ok(message)) = ws.next().await {
+            if let Message::Close(frame) = message {
+                let _ = close_tx.send(frame);
+                break;
+            }
+        }
+    });
+    let failing = futures::stream::iter([Err::<http_body::Frame<bytes::Bytes>, _>(
+        crate::ConnectError::internal("secret-token-123"),
+    )]);
+    let request = http::Request::post(format!("http://{addr}/test.v1.EchoService/Join"))
+        .header("content-type", "application/connect+proto")
+        .body(BodyExt::boxed(http_body_util::StreamBody::new(failing)))
+        .unwrap();
+    let err = WebSocketTransport::plaintext()
+        .send(request)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("secret-token-123"), "{err}");
+    let frame = close_rx.await.unwrap().expect("a Close frame with a code");
+    assert_eq!(u16::from(frame.code), 3102);
+    assert!(!frame.reason.contains("secret"), "{}", frame.reason);
+}
+
+#[tokio::test]
+async fn an_oversized_response_is_resource_exhausted() {
+    let (addr, _) = serve(WebSocketConfig::new()).await;
+    let transport = WebSocketTransport::plaintext().with_max_message_size(2);
+    let config = client_config(addr);
+
+    let err = call_unary::<_, _, StringValueView<'static>>(
+        &transport,
+        &config,
+        spec("/test.v1.EchoService/Echo", StreamType::Unary),
+        StringValue::from("too long"),
+        CallOptions::default(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::ResourceExhausted, "{err}");
+
+    // A streaming RPC reads the failure from the body, which the call path
+    // reports as internal, caused by the transport's error.
+    let mut stream = call_server_stream::<_, _, StringValueView<'static>>(
+        &transport,
+        &config,
+        spec("/test.v1.EchoService/Count", StreamType::ServerStream),
+        StringValue::from("3"),
+        CallOptions::default(),
+    )
+    .await
+    .unwrap();
+    let err = loop {
+        match stream.message().await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("the stream ended without an error"),
+            Err(err) => break err,
+        }
+    };
+    assert_eq!(err.code, ErrorCode::Internal, "{err}");
+    let cause = std::error::Error::source(&err)
+        .and_then(|source| source.downcast_ref::<crate::ConnectError>())
+        .expect("the transport's error as the source");
+    assert_eq!(cause.code, ErrorCode::ResourceExhausted);
 }
 
 #[tokio::test]
@@ -264,29 +385,15 @@ async fn client_rejects_reserved_headers_before_dialing() {
     assert_eq!(err.code, ErrorCode::InvalidArgument, "{err}");
 }
 
-// tungstenite fixes the callback's error type.
-#[allow(clippy::result_large_err)]
 #[tokio::test]
 async fn client_reports_an_early_s_while_still_sending() {
-    use futures::SinkExt;
     use tokio_tungstenite::tungstenite::Message;
     // A server that rejects the RPC as soon as it opens, then discards what
     // the client is still sending until it closes.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let (tcp, _) = listener.accept().await.unwrap();
-        let callback = |_: &tokio_tungstenite::tungstenite::handshake::server::Request,
-                        mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
-            response.headers_mut().insert(
-                "sec-websocket-protocol",
-                http::HeaderValue::from_static("connectrpc.1+proto"),
-            );
-            Ok(response)
-        };
-        let mut ws = tokio_tungstenite::accept_hdr_async(tcp, callback)
-            .await
-            .unwrap();
+        let mut ws = accept_proto(&listener).await;
         let _ = ws.next().await;
         ws.send(Message::Text("M{}".into())).await.unwrap();
         ws.send(Message::Text(

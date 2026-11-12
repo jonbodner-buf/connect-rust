@@ -372,12 +372,30 @@ async fn protocol_errors_end_the_stream() {
         1002,
     )
     .await;
+    // A reason longer than a Close frame carries is cut, not dropped.
+    let long_key = format!(r#"M{{"x-forwarded-{}":["a"]}}"#, "é".repeat(100));
+    expect_fault(json, vec![text(&long_key)], "invalid_argument", 1002).await;
     // Duplicate keys that fold together.
     expect_fault(
         json,
         vec![text(r#"M{"a":["1"],"A":["2"]}"#)],
         "invalid_argument",
         1002,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn invalid_utf8_closes_with_1007() {
+    use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
+
+    let invalid = Frame::message(&b"B\xff\xfe"[..], OpCode::Data(Data::Text), true);
+    expect_fault(
+        "connectrpc.1+json",
+        vec![text("M{}"), Message::Frame(invalid)],
+        "invalid_argument",
+        1007,
     )
     .await;
 }
